@@ -1,0 +1,47 @@
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.2.0 https://maven.apache.org/xsd/assembly-2.2.0.xsd">
+  <id>dist</id>
+  <formats>
+    <format>zip</format>
+  </formats>
+  <includeBaseDirectory>true</includeBaseDirectory>
+  <baseDirectory>jdiff-${project.version}</baseDirectory>
+
+  <dependencySets>
+    <dependencySet>
+      <outputDirectory>/</outputDirectory>
+      <useProjectArtifact>false</useProjectArtifact>
+      <includes>
+        <include>org.qubership.jdiff:jdiff-cli:jar:all</include>
+      </includes>
+      <outputFileNameMapping>jdiff.jar</outputFileNameMapping>
+    </dependencySet>
+    <dependencySet>
+      <outputDirectory>/</outputDirectory>
+      <useProjectArtifact>false</useProjectArtifact>
+      <includes>
+        <include>com.github.siom79.japicmp:japicmp:jar:jar-with-dependencies</include>
+      </includes>
+      <outputFileNameMapping>japicmp-0.26.1-jar-with-dependencies.jar</outputFileNameMapping>
+    </dependencySet>
+  </dependencySets>
+
+  <files>
+    <file>
+      <source>${project.basedir}/../README.md</source>
+      <outputDirectory>/</outputDirectory>
+    </file>
+    <file>
+      <source>${project.basedir}/src/assembly/jdiff.bat</source>
+      <outputDirectory>/</outputDirectory>
+      <destName>jdiff.bat</destName>
+    </file>
+    <file>
+      <source>${project.basedir}/src/assembly/jdiff.sh</source>
+      <outputDirectory>/</outputDirectory>
+      <destName>jdiff.sh</destName>
+      <fileMode>0755</fileMode>
+    </file>
+  </files>
+</assembly>

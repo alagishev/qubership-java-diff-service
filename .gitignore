@@ -1,0 +1,8 @@
+﻿target/
+*.class
+.superpowers/
+*.jar
+!japicmp/japicmp-*.jar
+dependency-reduced-pom.xml
+demo/out/
+demo/work/
