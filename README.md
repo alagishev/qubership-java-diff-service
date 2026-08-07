@@ -1,0 +1,1 @@
+# qubership-java-diff-service
