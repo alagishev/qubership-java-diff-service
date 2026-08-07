@@ -21,7 +21,8 @@ public class OutputOptions {
             description = "Comma-separated report formats: json,html,csv,xlsx (default: ${DEFAULT-VALUE}).")
     Set<String> format = new LinkedHashSet<>(List.of("json"));
 
-    @Option(names = "--repo", description = "Additional Maven repository URL (repeatable). Default: Maven Central.")
+    @Option(names = "--repo", description = "Maven repository as URL or id=url (repeatable). Default: Maven Central. "
+            + "Ids must match <server><id> in --settings.")
     List<String> repo = new ArrayList<>();
 
     @Option(names = "--settings", description = "Path to a Maven settings.xml.")

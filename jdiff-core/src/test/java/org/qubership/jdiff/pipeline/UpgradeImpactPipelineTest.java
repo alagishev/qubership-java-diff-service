@@ -18,10 +18,10 @@ import org.qubership.jdiff.model.DiffReport;
 import org.qubership.jdiff.model.Gav;
 import org.qubership.jdiff.model.ReportMode;
 import org.qubership.jdiff.model.UsageRef;
-import org.qubership.jdiff.resolve.DependencyExtractor;
 import org.qubership.jdiff.resolve.EffectivePomBuilder;
 import org.qubership.jdiff.resolve.MavenModule;
 import org.qubership.jdiff.resolve.ResolvedDependency;
+import org.qubership.jdiff.upgrade.UnmatchedUpgrade;
 import org.qubership.jdiff.upgrade.UpgradeSpec;
 
 class UpgradeImpactPipelineTest {
@@ -38,15 +38,15 @@ class UpgradeImpactPipelineTest {
         Path newDepJar = Files.createFile(tempDir.resolve("api-2.0.0.jar"));
 
         MavenModule module = new MavenModule(MODULE_GAV, pomFile, "jar", null);
-        ResolvedDependency directDep = new ResolvedDependency(OLD_DEP_GAV, "compile", false);
+        ResolvedDependency treeDep = new ResolvedDependency(OLD_DEP_GAV, "compile", false, 0);
 
         FakeArtifactResolver resolver = new FakeArtifactResolver()
                 .withJar(MODULE_GAV, moduleJar)
                 .withJar(OLD_DEP_GAV, oldDepJar)
-                .withJar(NEW_DEP_GAV, newDepJar);
+                .withJar(NEW_DEP_GAV, newDepJar)
+                .withDependencyTree(List.of(treeDep));
         EffectivePomBuilder pomBuilder = new FakeEffectivePomBuilder(resolver);
         FakeProjectScanner scanner = new FakeProjectScanner(pomBuilder, List.of(module));
-        FakeDependencyExtractor extractor = new FakeDependencyExtractor(pomBuilder, List.of(directDep));
 
         List<ApiChange> changes = List.of(
                 new ApiChange("com.dep.Api", "METHOD", "void doStuff()", "REMOVED",
@@ -60,7 +60,7 @@ class UpgradeImpactPipelineTest {
                 new ClassUsage("com.example.Main", "com.dep.OtherUnrelated", "api-1.0.0.jar"));
         FakeJdepsRunner jdeps = new FakeJdepsRunner(usages);
 
-        UpgradeImpactPipeline pipeline = new UpgradeImpactPipeline(resolver, pomBuilder, scanner, extractor, jdeps,
+        UpgradeImpactPipeline pipeline = new UpgradeImpactPipeline(resolver, pomBuilder, scanner, jdeps,
                 comparator, 2);
         UpgradeRequest request = new UpgradeRequest(tempDir, null, List.of(UpgradeSpec.parse("com.dep:api=2.0.0")));
 
@@ -81,11 +81,77 @@ class UpgradeImpactPipelineTest {
         assertThat(artifact.oldVersion()).isEqualTo("1.0.0");
         assertThat(artifact.newVersion()).isEqualTo("2.0.0");
         assertThat(artifact.semverVerdict()).isEqualTo("MAJOR");
+        assertThat(artifact.dependencyOrigin()).isEqualTo("direct");
         assertThat(artifact.changes()).hasSize(1);
         ApiChange impactedChange = artifact.changes().get(0);
         assertThat(impactedChange.className()).isEqualTo("com.dep.Api");
         assertThat(impactedChange.usedBy()).containsExactly(
                 new UsageRef("com.example:app", List.of("com.example.Main")));
+    }
+
+    @Test
+    void matchesTransitiveUpgradeFromResolvedTree(@TempDir Path tempDir) throws IOException {
+        Path moduleJar = Files.createFile(tempDir.resolve("app-1.0.0.jar"));
+        Path pomFile = Files.createFile(tempDir.resolve("pom.xml"));
+        Path oldDepJar = Files.createFile(tempDir.resolve("api-1.0.0.jar"));
+        Path newDepJar = Files.createFile(tempDir.resolve("api-2.0.0.jar"));
+
+        MavenModule module = new MavenModule(MODULE_GAV, pomFile, "jar", null);
+        ResolvedDependency transitiveDep = new ResolvedDependency(OLD_DEP_GAV, "compile", false, 2);
+
+        FakeArtifactResolver resolver = new FakeArtifactResolver()
+                .withJar(MODULE_GAV, moduleJar)
+                .withJar(OLD_DEP_GAV, oldDepJar)
+                .withJar(NEW_DEP_GAV, newDepJar)
+                .withDependencyTree(List.of(transitiveDep));
+        EffectivePomBuilder pomBuilder = new FakeEffectivePomBuilder(resolver);
+        FakeProjectScanner scanner = new FakeProjectScanner(pomBuilder, List.of(module));
+
+        List<ApiChange> changes = List.of(new ApiChange("com.dep.Api", "METHOD", "void doStuff()", "REMOVED",
+                List.of("METHOD_REMOVED"), null, false, false, true, "MAJOR", null));
+        FakeJarComparator comparator = new FakeJarComparator(new JapicmpResult("1.0.0", "2.0.0", "MAJOR", changes));
+        FakeJdepsRunner jdeps = new FakeJdepsRunner(Set.of(
+                new ClassUsage("com.example.Main", "com.dep.Api", "api-1.0.0.jar")));
+
+        UpgradeImpactPipeline pipeline = new UpgradeImpactPipeline(resolver, pomBuilder, scanner, jdeps,
+                comparator, 2);
+        DiffReport report = pipeline.run(new UpgradeRequest(tempDir, null,
+                List.of(UpgradeSpec.parse("com.dep:api=2.0.0"))));
+
+        assertThat(report.input()).containsEntry("unmatchedUpgrades", List.of());
+        assertThat(report.artifacts()).hasSize(1);
+        assertThat(report.artifacts().get(0).dependencyOrigin()).isEqualTo("transitive");
+        assertThat(report.input()).containsEntry("impactedChanges", 1);
+        assertThat(jdeps.lastClasspath()).containsExactly(oldDepJar);
+    }
+
+    @Test
+    void reportsUnmatchedUpgradeWithReasonAndUsageWarning(@TempDir Path tempDir) throws IOException {
+        Path moduleJar = Files.createFile(tempDir.resolve("app-1.0.0.jar"));
+        Path pomFile = Files.createFile(tempDir.resolve("pom.xml"));
+
+        MavenModule module = new MavenModule(MODULE_GAV, pomFile, "jar", null);
+        FakeArtifactResolver resolver = new FakeArtifactResolver()
+                .withJar(MODULE_GAV, moduleJar)
+                .withDependencyTree(List.of());
+        EffectivePomBuilder pomBuilder = new FakeEffectivePomBuilder(resolver);
+        FakeProjectScanner scanner = new FakeProjectScanner(pomBuilder, List.of(module));
+        FakeJarComparator comparator = new FakeJarComparator(new JapicmpResult("1.0.0", "2.0.0", "NONE", List.of()));
+        FakeJdepsRunner jdeps = new FakeJdepsRunner(Set.of(
+                new ClassUsage("com.example.Main", "com.dep.Api", "api-1.0.0.jar")));
+
+        UpgradeImpactPipeline pipeline = new UpgradeImpactPipeline(resolver, pomBuilder, scanner, jdeps,
+                comparator, 2);
+        DiffReport report = pipeline.run(new UpgradeRequest(tempDir, null,
+                List.of(UpgradeSpec.parse("com.dep:api=2.0.0"))));
+
+        assertThat(report.artifacts()).isEmpty();
+        assertThat(report.input().get("unmatchedUpgrades")).isEqualTo(List.of(
+                new UnmatchedUpgrade("com.dep:api=2.0.0", UnmatchedUpgrade.NOT_IN_RESOLVED_TREE)));
+        @SuppressWarnings("unchecked")
+        List<String> warnings = (List<String>) report.input().get("warnings");
+        assertThat(warnings).anyMatch(w -> w.contains("API used from artifact 'api'")
+                && w.contains(UnmatchedUpgrade.NOT_IN_RESOLVED_TREE));
     }
 
     @Test
@@ -96,22 +162,22 @@ class UpgradeImpactPipelineTest {
         Path newDepJar = Files.createFile(tempDir.resolve("api-2.0.0.jar"));
 
         MavenModule module = new MavenModule(MODULE_GAV, pomFile, "jar", fallbackJar);
-        ResolvedDependency directDep = new ResolvedDependency(OLD_DEP_GAV, "compile", false);
+        ResolvedDependency treeDep = new ResolvedDependency(OLD_DEP_GAV, "compile", false, 0);
 
         FakeArtifactResolver resolver = new FakeArtifactResolver()
                 // module gav intentionally NOT registered, so resolveJar throws for it
                 .withJar(OLD_DEP_GAV, oldDepJar)
-                .withJar(NEW_DEP_GAV, newDepJar);
+                .withJar(NEW_DEP_GAV, newDepJar)
+                .withDependencyTree(List.of(treeDep));
         EffectivePomBuilder pomBuilder = new FakeEffectivePomBuilder(resolver);
         FakeProjectScanner scanner = new FakeProjectScanner(pomBuilder, List.of(module));
-        FakeDependencyExtractor extractor = new FakeDependencyExtractor(pomBuilder, List.of(directDep));
 
         List<ApiChange> changes = List.of(new ApiChange("com.dep.Api", "METHOD", "void doStuff()", "REMOVED",
                 List.of("METHOD_REMOVED"), null, false, false, true, "MAJOR", null));
         FakeJarComparator comparator = new FakeJarComparator(new JapicmpResult("1.0.0", "2.0.0", "MAJOR", changes));
         FakeJdepsRunner jdeps = new FakeJdepsRunner(Set.of());
 
-        UpgradeImpactPipeline pipeline = new UpgradeImpactPipeline(resolver, pomBuilder, scanner, extractor, jdeps,
+        UpgradeImpactPipeline pipeline = new UpgradeImpactPipeline(resolver, pomBuilder, scanner, jdeps,
                 comparator, 2);
         UpgradeRequest request = new UpgradeRequest(tempDir, null, List.of(UpgradeSpec.parse("com.dep:api=2.0.0")));
 
@@ -133,15 +199,14 @@ class UpgradeImpactPipelineTest {
         Path oldDepJar = Files.createFile(tempDir.resolve("managed-lib-1.0.0.jar"));
         Path newDepJar = Files.createFile(tempDir.resolve("managed-lib-2.0.0.jar"));
 
+        ResolvedDependency treeDep = new ResolvedDependency(oldManagedGav, "compile", false, 0);
         FakeArtifactResolver resolver = new FakeArtifactResolver(fixturesDir)
                 .withJar(childGav, moduleJar)
                 .withJar(oldManagedGav, oldDepJar)
-                .withJar(newManagedGav, newDepJar);
+                .withJar(newManagedGav, newDepJar)
+                .withDependencyTree(List.of(treeDep));
 
-        // Real EffectivePomBuilder + DependencyExtractor: this is the point of the test, proving the
-        // BOM-through-lineage machinery works against the real Maven ModelBuilder, offline.
         EffectivePomBuilder pomBuilder = new EffectivePomBuilder(resolver);
-        DependencyExtractor extractor = new DependencyExtractor(pomBuilder);
 
         MavenModule module = new MavenModule(childGav, fixturesDir.resolve("lineage-child-1.0.pom"), "jar", null);
         FakeProjectScanner scanner = new FakeProjectScanner(pomBuilder, List.of(module));
@@ -154,9 +219,8 @@ class UpgradeImpactPipelineTest {
                 new ClassUsage("org.example.LineageChildMain", "org.example.ManagedLib", "managed-lib-1.0.0.jar"));
         FakeJdepsRunner jdeps = new FakeJdepsRunner(usages);
 
-        UpgradeImpactPipeline pipeline = new UpgradeImpactPipeline(resolver, pomBuilder, scanner, extractor, jdeps,
+        UpgradeImpactPipeline pipeline = new UpgradeImpactPipeline(resolver, pomBuilder, scanner, jdeps,
                 comparator, 2);
-        // The BOM is declared and used by the module's PARENT POM, not the module's own raw POM.
         UpgradeRequest request = new UpgradeRequest(tempDir, null, List.of(UpgradeSpec.parse("org.example:my-bom=2.0")));
 
         DiffReport report = pipeline.run(request);

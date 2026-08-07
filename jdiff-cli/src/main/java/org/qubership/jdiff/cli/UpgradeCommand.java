@@ -16,7 +16,6 @@ import org.qubership.jdiff.pipeline.JarComparator;
 import org.qubership.jdiff.pipeline.UpgradeImpactPipeline;
 import org.qubership.jdiff.pipeline.UpgradeRequest;
 import org.qubership.jdiff.resolve.ArtifactResolver;
-import org.qubership.jdiff.resolve.DependencyExtractor;
 import org.qubership.jdiff.resolve.EffectivePomBuilder;
 import org.qubership.jdiff.resolve.ProjectScanner;
 import org.qubership.jdiff.tools.ExternalToolRunner;
@@ -121,9 +120,8 @@ public class UpgradeCommand implements Callable<Integer> {
         ArtifactResolver resolver = CliSupport.artifactResolver(options);
         EffectivePomBuilder pomBuilder = new EffectivePomBuilder(resolver);
         ProjectScanner scanner = new ProjectScanner(pomBuilder);
-        DependencyExtractor extractor = new DependencyExtractor(pomBuilder);
         JdepsRunner jdeps = new JdepsRunner(new ExternalToolRunner());
         JarComparator comparator = CliSupport.japicmpComparator(options);
-        return new UpgradeImpactPipeline(resolver, pomBuilder, scanner, extractor, jdeps, comparator, options.threads);
+        return new UpgradeImpactPipeline(resolver, pomBuilder, scanner, jdeps, comparator, options.threads);
     }
 }

@@ -14,6 +14,7 @@ class FakeJdepsRunner extends JdepsRunner {
 
     private final Set<ClassUsage> usages;
     private volatile Path lastTargetJar;
+    private volatile List<Path> lastClasspath = List.of();
 
     FakeJdepsRunner(Set<ClassUsage> usages) {
         super(null, Path.of("unused"));
@@ -23,10 +24,15 @@ class FakeJdepsRunner extends JdepsRunner {
     @Override
     public Set<ClassUsage> analyze(Path targetJar, List<Path> dependencyJars) {
         this.lastTargetJar = targetJar;
+        this.lastClasspath = List.copyOf(dependencyJars);
         return usages;
     }
 
     Path lastTargetJar() {
         return lastTargetJar;
+    }
+
+    List<Path> lastClasspath() {
+        return lastClasspath;
     }
 }

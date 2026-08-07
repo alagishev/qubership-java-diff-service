@@ -3,6 +3,7 @@ package org.qubership.jdiff.pipeline;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -27,7 +28,6 @@ import org.qubership.jdiff.model.Gav;
 import org.qubership.jdiff.model.ReportMode;
 import org.qubership.jdiff.resolve.ArtifactResolutionException;
 import org.qubership.jdiff.resolve.ArtifactResolver;
-import org.qubership.jdiff.resolve.DependencyExtractor;
 import org.qubership.jdiff.resolve.EffectivePomBuilder;
 import org.qubership.jdiff.resolve.EffectivePomBuilder.BuildOutcome;
 import org.qubership.jdiff.resolve.MavenModule;
@@ -35,6 +35,7 @@ import org.qubership.jdiff.resolve.ProjectScanner;
 import org.qubership.jdiff.resolve.ResolvedDependency;
 import org.qubership.jdiff.upgrade.BomUpgradeExpander;
 import org.qubership.jdiff.upgrade.ImpactAnalyzer;
+import org.qubership.jdiff.upgrade.UnmatchedUpgrade;
 import org.qubership.jdiff.upgrade.UpgradeItem;
 import org.qubership.jdiff.upgrade.UpgradeMatcher;
 import org.qubership.jdiff.upgrade.UpgradeSpec;
@@ -43,9 +44,9 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Produces the upgrade-impact report (mode: {@code upgrade-impact}): resolves the target modules'
- * dependencies, matches requested upgrades against them (directly, or via BOM expansion), analyzes
- * class-level usage of the affected dependencies via jdeps, diffs the affected dependencies via
- * japicmp, and keeps only the API changes actually used by a module.
+ * dependency trees, matches requested upgrades against them (directly, transitively, or via BOM
+ * expansion), analyzes class-level usage of the affected dependencies via jdeps, diffs the affected
+ * dependencies via japicmp, and keeps only the API changes actually used by a module.
  */
 public class UpgradeImpactPipeline {
 
@@ -57,7 +58,6 @@ public class UpgradeImpactPipeline {
     private final ArtifactResolver resolver;
     private final EffectivePomBuilder pomBuilder;
     private final ProjectScanner scanner;
-    private final DependencyExtractor extractor;
     private final JdepsRunner jdeps;
     private final JarComparator comparator;
     private final int threads;
@@ -65,11 +65,10 @@ public class UpgradeImpactPipeline {
     private final BomUpgradeExpander bomExpander;
 
     public UpgradeImpactPipeline(ArtifactResolver resolver, EffectivePomBuilder pomBuilder, ProjectScanner scanner,
-            DependencyExtractor extractor, JdepsRunner jdeps, JarComparator comparator, int threads) {
+            JdepsRunner jdeps, JarComparator comparator, int threads) {
         this.resolver = resolver;
         this.pomBuilder = pomBuilder;
         this.scanner = scanner;
-        this.extractor = extractor;
         this.jdeps = jdeps;
         this.comparator = comparator;
         this.threads = threads;
@@ -89,6 +88,7 @@ public class UpgradeImpactPipeline {
 
         List<AnalyzedModule> analyzedModules = new ArrayList<>();
         List<UpgradeItem> matchedItems = new ArrayList<>();
+        Map<String, BomExpandOutcome> bomOutcomesByGa = new HashMap<>();
         Set<String> matchedSpecGas = new HashSet<>();
         List<String> modulesAnalyzed = new ArrayList<>();
 
@@ -99,34 +99,45 @@ public class UpgradeImpactPipeline {
             }
 
             BuildOutcome outcome = buildOutcome(moduleTarget);
-            List<ResolvedDependency> directDeps = extractor.directDependencies(outcome.effective());
-            LOG.debug("Module {} direct dependencies: {}", moduleTarget.gav(), directDeps);
+            List<ResolvedDependency> treeDeps = resolver.resolveDependencyTree(moduleTarget.gav(), outcome.effective());
+            LOG.debug("Module {} resolved dependency tree: {}", moduleTarget.gav(), treeDeps);
 
-            UpgradeMatcher.MatchResult matchResult = matcher.match(request.upgrades(), directDeps);
-            matchedItems.addAll(matchResult.direct());
-            matchResult.direct().forEach(item -> matchedSpecGas.add(item.ga()));
+            UpgradeMatcher.MatchResult matchResult = matcher.match(request.upgrades(), treeDeps);
+            matchedItems.addAll(matchResult.matched());
+            matchResult.matched().forEach(item -> matchedSpecGas.add(item.ga()));
 
             for (UpgradeSpec spec : matchResult.unmatchedSpecs()) {
-                List<UpgradeItem> expanded = tryExpandBom(spec, outcome, moduleTarget.gav(), directDeps);
-                if (expanded != null) {
-                    matchedItems.addAll(expanded);
+                BomExpandOutcome bomOutcome = tryExpandBom(spec, outcome, moduleTarget.gav(), treeDeps);
+                bomOutcomesByGa.merge(spec.ga(), bomOutcome, BomExpandOutcome::combine);
+                if (bomOutcome.status() == BomExpandStatus.EXPANDED) {
+                    matchedItems.addAll(bomOutcome.items());
                     matchedSpecGas.add(spec.ga());
                 }
             }
 
-            analyzedModules.add(new AnalyzedModule(moduleTarget.gav(), moduleJar, directDeps));
+            analyzedModules.add(new AnalyzedModule(moduleTarget.gav(), moduleJar, treeDeps));
             modulesAnalyzed.add(moduleTarget.gav().toString());
         }
 
-        List<UpgradeSpec> unmatchedSpecs = request.upgrades().stream()
-                .filter(spec -> !matchedSpecGas.contains(spec.ga()))
-                .toList();
-        unmatchedSpecs.forEach(spec ->
-                LOG.warn("Requested upgrade {} matches no dependency", specToString(spec)));
+        List<UnmatchedUpgrade> unmatchedUpgrades = new ArrayList<>();
+        for (UpgradeSpec spec : request.upgrades()) {
+            if (matchedSpecGas.contains(spec.ga())) {
+                continue;
+            }
+            BomExpandOutcome bomOutcome = bomOutcomesByGa.get(spec.ga());
+            String reason = (bomOutcome != null && bomOutcome.status() == BomExpandStatus.EMPTY)
+                    ? UnmatchedUpgrade.BOM_NOT_EXPANDED
+                    : UnmatchedUpgrade.NOT_IN_RESOLVED_TREE;
+            unmatchedUpgrades.add(new UnmatchedUpgrade(specToString(spec), reason));
+            LOG.warn("Requested upgrade {} unmatched ({})", specToString(spec), reason);
+        }
 
         List<UpgradeItem> distinctItems = matchedItems.stream().distinct().toList();
 
         Map<String, Set<ClassUsage>> usageByModule = analyzeUsage(analyzedModules);
+        List<String> warnings = buildUsageWarnings(unmatchedUpgrades, usageByModule);
+        warnings.forEach(LOG::warn);
+
         Map<UpgradeItem, ComparisonOutcome> comparisons = compareUpgrades(distinctItems);
 
         List<ArtifactReport> artifactReports = new ArrayList<>();
@@ -141,7 +152,8 @@ public class UpgradeImpactPipeline {
             LOG.info("Upgrade {} {} -> {}: {}/{} change(s) impacted", item.ga(), item.oldVersion(), item.newVersion(),
                     impacted.size(), changes.size());
             artifactReports.add(new ArtifactReport(item.groupId(), item.artifactId(), item.oldVersion(),
-                    item.newVersion(), outcome.result().semverVerdict(), impacted));
+                    item.newVersion(), outcome.result().semverVerdict(), impacted,
+                    item.direct() ? "direct" : "transitive"));
         }
 
         Map<String, Object> input = new LinkedHashMap<>();
@@ -151,7 +163,8 @@ public class UpgradeImpactPipeline {
             input.put("gav", request.targetGav().toString());
         }
         input.put("requestedUpgrades", request.upgrades().stream().map(UpgradeImpactPipeline::specToString).toList());
-        input.put("unmatchedUpgrades", unmatchedSpecs.stream().map(UpgradeImpactPipeline::specToString).toList());
+        input.put("unmatchedUpgrades", unmatchedUpgrades);
+        input.put("warnings", warnings);
         input.put("modulesAnalyzed", modulesAnalyzed);
         input.put("totalChanges", totalChanges);
         input.put("impactedChanges", impactedChanges);
@@ -195,32 +208,47 @@ public class UpgradeImpactPipeline {
                 : pomBuilder.buildFull(moduleTarget.gav());
     }
 
-    private List<UpgradeItem> tryExpandBom(UpgradeSpec spec, BuildOutcome outcome, Gav moduleGav,
-            List<ResolvedDependency> directDeps) {
+    private BomExpandOutcome tryExpandBom(UpgradeSpec spec, BuildOutcome outcome, Gav moduleGav,
+            List<ResolvedDependency> treeDeps) {
         Dependency bomDependency = findImportBom(outcome.rawLineage(), spec.groupId(), spec.artifactId());
-        if (bomDependency == null) {
-            return null;
+        if (bomDependency != null) {
+            String oldVersion = interpolate(bomDependency.getVersion(), outcome.effective());
+            if (oldVersion == null) {
+                return BomExpandOutcome.notBom();
+            }
+            Gav oldBom = new Gav(spec.groupId(), spec.artifactId(), oldVersion, null);
+            List<UpgradeItem> expanded = bomExpander.expand(oldBom, spec.newVersion(), treeDeps);
+            return toBomOutcome(oldBom, spec.newVersion(), moduleGav, expanded);
         }
-        String oldVersion = interpolate(bomDependency.getVersion(), outcome.effective());
-        if (oldVersion == null) {
-            return null;
+
+        Gav newBom = new Gav(spec.groupId(), spec.artifactId(), spec.newVersion(), null);
+        try {
+            if (!bomExpander.isBom(newBom)) {
+                return BomExpandOutcome.notBom();
+            }
+        } catch (RuntimeException e) {
+            LOG.debug("Could not inspect {} as BOM: {}", newBom, e.getMessage());
+            return BomExpandOutcome.notBom();
         }
-        Gav oldBom = new Gav(spec.groupId(), spec.artifactId(), oldVersion, null);
-        List<UpgradeItem> expanded = bomExpander.expand(oldBom, spec.newVersion(), directDeps);
-        LOG.info("Expanded BOM upgrade {} -> {} for module {}: {} dependency upgrade(s)", oldBom, spec.newVersion(),
+        List<UpgradeItem> expanded = bomExpander.expandFromNewBom(newBom, treeDeps);
+        return toBomOutcome(newBom, spec.newVersion(), moduleGav, expanded);
+    }
+
+    private static BomExpandOutcome toBomOutcome(Gav bomGav, String newVersion, Gav moduleGav,
+            List<UpgradeItem> expanded) {
+        LOG.info("Expanded BOM upgrade {} -> {} for module {}: {} dependency upgrade(s)", bomGav, newVersion,
                 moduleGav, expanded.size());
         if (expanded.isEmpty()) {
-            LOG.warn("Upgraded BOM {} -> {} manages no direct dependency of module {}", oldBom, spec.newVersion(),
-                    moduleGav);
+            LOG.warn("Upgraded BOM {} -> {} manages no dependency in the resolved tree of module {}", bomGav,
+                    newVersion, moduleGav);
+            return BomExpandOutcome.empty();
         }
-        return expanded;
+        return BomExpandOutcome.expanded(expanded);
     }
 
     /**
      * Searches the module's raw model lineage (own model first, then ancestors, nearest first) for an
-     * import-scoped {@code dependencyManagement} entry matching {@code groupId:artifactId}. Real Maven
-     * projects commonly declare and inherit import-scoped BOMs from a parent POM rather than the
-     * module's own, so the whole lineage must be searched, not just the module's own raw model.
+     * import-scoped {@code dependencyManagement} entry matching {@code groupId:artifactId}.
      */
     private static Dependency findImportBom(List<Model> rawLineage, String groupId, String artifactId) {
         for (Model rawModel : rawLineage) {
@@ -238,14 +266,6 @@ public class UpgradeImpactPipeline {
         return null;
     }
 
-    /**
-     * Resolves {@code ${...}} placeholders in {@code value} against the effective model's properties
-     * (which already include properties inherited from ancestors).
-     *
-     * @return the interpolated value, or {@code null} if a referenced property cannot be resolved (in
-     *         which case a WARN is logged and the caller should treat the upgrade as unmatched for
-     *         this module rather than aborting the whole run)
-     */
     private static String interpolate(String value, Model effectiveModel) {
         if (value == null || !value.contains("${")) {
             return value;
@@ -297,7 +317,7 @@ public class UpgradeImpactPipeline {
 
     private List<Path> resolveDependencyJars(AnalyzedModule module) {
         List<Path> jars = new ArrayList<>();
-        for (ResolvedDependency dep : module.directDeps()) {
+        for (ResolvedDependency dep : module.treeDeps()) {
             try {
                 jars.add(resolver.resolveJar(dep.gav()));
             } catch (ArtifactResolutionException e) {
@@ -306,6 +326,42 @@ public class UpgradeImpactPipeline {
             }
         }
         return jars;
+    }
+
+    private List<String> buildUsageWarnings(List<UnmatchedUpgrade> unmatchedUpgrades,
+            Map<String, Set<ClassUsage>> usageByModule) {
+        if (unmatchedUpgrades.isEmpty()) {
+            return List.of();
+        }
+        Set<String> usedJarNames = new HashSet<>();
+        for (Set<ClassUsage> usages : usageByModule.values()) {
+            for (ClassUsage usage : usages) {
+                usedJarNames.add(usage.providerJar());
+            }
+        }
+
+        List<String> warnings = new ArrayList<>();
+        for (UnmatchedUpgrade unmatched : unmatchedUpgrades) {
+            String artifactId = artifactIdFromUpgrade(unmatched.upgrade());
+            if (artifactId == null) {
+                continue;
+            }
+            boolean used = usedJarNames.stream().anyMatch(jar -> jar != null && jar.startsWith(artifactId + "-"));
+            if (used) {
+                warnings.add("API used from artifact '" + artifactId
+                        + "', but upgrade was unmatched (" + unmatched.reason() + "): " + unmatched.upgrade());
+            }
+        }
+        return warnings;
+    }
+
+    private static String artifactIdFromUpgrade(String upgrade) {
+        int colon = upgrade.lastIndexOf(':');
+        int eq = upgrade.indexOf('=');
+        if (colon < 0 || eq < 0 || eq <= colon) {
+            return null;
+        }
+        return upgrade.substring(colon + 1, eq);
     }
 
     private Map<UpgradeItem, ComparisonOutcome> compareUpgrades(List<UpgradeItem> items) {
@@ -358,9 +414,45 @@ public class UpgradeImpactPipeline {
     private record ModuleTarget(Gav gav, Path pomFile, Path targetJarFallback) {
     }
 
-    private record AnalyzedModule(Gav gav, Path jar, List<ResolvedDependency> directDeps) {
+    private record AnalyzedModule(Gav gav, Path jar, List<ResolvedDependency> treeDeps) {
     }
 
     private record ComparisonOutcome(JapicmpResult result, String oldJarFileName) {
+    }
+
+    private enum BomExpandStatus {
+        NOT_BOM,
+        EMPTY,
+        EXPANDED
+    }
+
+    private record BomExpandOutcome(BomExpandStatus status, List<UpgradeItem> items) {
+
+        static BomExpandOutcome notBom() {
+            return new BomExpandOutcome(BomExpandStatus.NOT_BOM, List.of());
+        }
+
+        static BomExpandOutcome empty() {
+            return new BomExpandOutcome(BomExpandStatus.EMPTY, List.of());
+        }
+
+        static BomExpandOutcome expanded(List<UpgradeItem> items) {
+            return new BomExpandOutcome(BomExpandStatus.EXPANDED, items);
+        }
+
+        BomExpandOutcome combine(BomExpandOutcome other) {
+            if (status == BomExpandStatus.EXPANDED) {
+                List<UpgradeItem> merged = new ArrayList<>(items);
+                merged.addAll(other.items);
+                return expanded(merged);
+            }
+            if (other.status == BomExpandStatus.EXPANDED) {
+                return other;
+            }
+            if (status == BomExpandStatus.EMPTY || other.status == BomExpandStatus.EMPTY) {
+                return empty();
+            }
+            return notBom();
+        }
     }
 }

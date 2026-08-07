@@ -26,7 +26,6 @@ import org.qubership.jdiff.pipeline.JarComparator;
 import org.qubership.jdiff.pipeline.UpgradeImpactPipeline;
 import org.qubership.jdiff.pipeline.UpgradeRequest;
 import org.qubership.jdiff.resolve.ArtifactResolver;
-import org.qubership.jdiff.resolve.DependencyExtractor;
 import org.qubership.jdiff.resolve.EffectivePomBuilder;
 import org.qubership.jdiff.resolve.MavenArtifactResolver;
 import org.qubership.jdiff.resolve.ProjectScanner;
@@ -42,6 +41,9 @@ import org.qubership.jdiff.upgrade.UpgradeSpec;
  * {@link CliSupport#resolveJapicmpJarOrThrow(Path)} honoring a {@value #JAPICMP_JAR_ENV} environment
  * variable override (there is no {@code --japicmp-jar} flag in MCP mode).
  *
+ * <p>Maven repositories and settings are process-wide ({@code mcp-server --repo} /
+ * {@code --settings}), not per-tool arguments.
+ *
  * <p>The pipeline-running collaborators are injected via functional factories so tests can supply
  * fakes without exercising real artifact resolution or japicmp.
  */
@@ -53,25 +55,56 @@ public final class McpTools {
 
     private static final String JAPICMP_JAR_ENV = "JDIFF_JAPICMP_JAR";
 
+    private final Path settingsXml;
+    private final List<String> repoTokens;
     private final ApiReportRunner apiReportRunner;
     private final ApiDiffRunner apiDiffRunner;
     private final UpgradeImpactRunner upgradeImpactRunner;
 
     /**
-     * @return an {@link McpTools} instance wired to the real pipelines and Maven/japicmp plumbing
+     * @return an {@link McpTools} instance wired to the real pipelines with default Central repos
      */
     public static McpTools createDefault() {
+        return createDefault(null, List.of());
+    }
+
+    /**
+     * @param settingsXml optional Maven {@code settings.xml} for every tool call; may be {@code null}
+     * @param repoTokens  process-wide {@code --repo} tokens ({@code id=url} or bare URL); may be empty
+     * @return an {@link McpTools} instance wired to the real pipelines and Maven/japicmp plumbing
+     */
+    public static McpTools createDefault(Path settingsXml, List<String> repoTokens) {
+        List<String> repos = repoTokens != null ? List.copyOf(repoTokens) : List.of();
         return new McpTools(
-                (gav, repositories) -> buildApiReportPipeline(repositories).run(gav),
-                (groupId, artifactId, oldVersion, newVersion, repositories) ->
-                        buildApiDiffPipeline(repositories).run(groupId, artifactId, oldVersion, newVersion),
-                (request, repositories, threads) -> buildUpgradeImpactPipeline(repositories, threads).run(request));
+                settingsXml,
+                repos,
+                gav -> buildApiReportPipeline(repos, settingsXml).run(gav),
+                (groupId, artifactId, oldVersion, newVersion) ->
+                        buildApiDiffPipeline(repos, settingsXml).run(groupId, artifactId, oldVersion, newVersion),
+                (request, threads) -> buildUpgradeImpactPipeline(repos, settingsXml, threads).run(request));
     }
 
     McpTools(ApiReportRunner apiReportRunner, ApiDiffRunner apiDiffRunner, UpgradeImpactRunner upgradeImpactRunner) {
+        this(null, List.of(), apiReportRunner, apiDiffRunner, upgradeImpactRunner);
+    }
+
+    McpTools(Path settingsXml, List<String> repoTokens, ApiReportRunner apiReportRunner, ApiDiffRunner apiDiffRunner,
+            UpgradeImpactRunner upgradeImpactRunner) {
+        this.settingsXml = settingsXml;
+        this.repoTokens = repoTokens != null ? List.copyOf(repoTokens) : List.of();
         this.apiReportRunner = apiReportRunner;
         this.apiDiffRunner = apiDiffRunner;
         this.upgradeImpactRunner = upgradeImpactRunner;
+    }
+
+    /** Package-visible for tests. */
+    Path settingsXml() {
+        return settingsXml;
+    }
+
+    /** Package-visible for tests. */
+    List<String> repoTokens() {
+        return repoTokens;
     }
 
     /**
@@ -120,8 +153,7 @@ public final class McpTools {
         } catch (IllegalArgumentException e) {
             return validationError(e.getMessage());
         }
-        List<String> repositories = stringListArg(args, "repositories");
-        return execute(() -> apiReportRunner.run(gav, repositories));
+        return execute(() -> apiReportRunner.run(gav));
     }
 
     private CallToolResult handleGenerateApiDiff(McpSyncServerExchange exchange, CallToolRequest request) {
@@ -139,8 +171,7 @@ public final class McpTools {
         } catch (IllegalArgumentException e) {
             return validationError(e.getMessage());
         }
-        List<String> repositories = stringListArg(args, "repositories");
-        return execute(() -> apiDiffRunner.run(ga[0], ga[1], oldVersion, newVersion, repositories));
+        return execute(() -> apiDiffRunner.run(ga[0], ga[1], oldVersion, newVersion));
     }
 
     private CallToolResult handleUpgradeImpact(McpSyncServerExchange exchange, CallToolRequest request) {
@@ -168,9 +199,8 @@ public final class McpTools {
         } catch (IllegalArgumentException e) {
             return validationError(e.getMessage());
         }
-        List<String> repositories = stringListArg(args, "repositories");
         int threads = intArg(args, "threads", Runtime.getRuntime().availableProcessors());
-        return execute(() -> upgradeImpactRunner.run(upgradeRequest, repositories, threads));
+        return execute(() -> upgradeImpactRunner.run(upgradeRequest, threads));
     }
 
     private static CallToolResult execute(Supplier<DiffReport> action) {
@@ -254,8 +284,13 @@ public final class McpTools {
         return parts;
     }
 
-    private static ArtifactResolver buildResolver(List<String> repositories) {
-        return new MavenArtifactResolver(RepositoryConfig.of(repositories, null));
+    private static ArtifactResolver buildResolver(List<String> repositories, Path settingsXml) {
+        return new MavenArtifactResolver(repositoryConfig(repositories, settingsXml));
+    }
+
+    /** Package-visible for tests. */
+    static RepositoryConfig repositoryConfig(List<String> repositories, Path settingsXml) {
+        return RepositoryConfig.of(repositories, settingsXml);
     }
 
     private static JarComparator buildComparator() {
@@ -265,27 +300,26 @@ public final class McpTools {
         return new JapicmpJarComparator(runner, CliSupport.createWorkDir());
     }
 
-    private static ApiReportPipeline buildApiReportPipeline(List<String> repositories) {
-        return new ApiReportPipeline(buildResolver(repositories), buildComparator());
+    private static ApiReportPipeline buildApiReportPipeline(List<String> repositories, Path settingsXml) {
+        return new ApiReportPipeline(buildResolver(repositories, settingsXml), buildComparator());
     }
 
-    private static ApiDiffPipeline buildApiDiffPipeline(List<String> repositories) {
-        return new ApiDiffPipeline(buildResolver(repositories), buildComparator());
+    private static ApiDiffPipeline buildApiDiffPipeline(List<String> repositories, Path settingsXml) {
+        return new ApiDiffPipeline(buildResolver(repositories, settingsXml), buildComparator());
     }
 
-    private static UpgradeImpactPipeline buildUpgradeImpactPipeline(List<String> repositories, int threads) {
-        ArtifactResolver resolver = buildResolver(repositories);
+    private static UpgradeImpactPipeline buildUpgradeImpactPipeline(List<String> repositories, Path settingsXml,
+            int threads) {
+        ArtifactResolver resolver = buildResolver(repositories, settingsXml);
         EffectivePomBuilder pomBuilder = new EffectivePomBuilder(resolver);
         ProjectScanner scanner = new ProjectScanner(pomBuilder);
-        DependencyExtractor extractor = new DependencyExtractor(pomBuilder);
         JdepsRunner jdeps = new JdepsRunner(new ExternalToolRunner());
-        return new UpgradeImpactPipeline(resolver, pomBuilder, scanner, extractor, jdeps, buildComparator(), threads);
+        return new UpgradeImpactPipeline(resolver, pomBuilder, scanner, jdeps, buildComparator(), threads);
     }
 
     private static Map<String, Object> generateApiReportSchema() {
         Map<String, Object> properties = new LinkedHashMap<>();
         properties.put("gav", stringProperty("Maven coordinate \"groupId:artifactId:version[:classifier]\""));
-        properties.put("repositories", stringArrayProperty("Extra Maven repository URLs"));
         return objectSchema(properties, List.of("gav"));
     }
 
@@ -294,7 +328,6 @@ public final class McpTools {
         properties.put("gav", stringProperty("Maven coordinate \"groupId:artifactId\""));
         properties.put("oldVersion", stringProperty("Version to diff from"));
         properties.put("newVersion", stringProperty("Version to diff to"));
-        properties.put("repositories", stringArrayProperty("Extra Maven repository URLs"));
         return objectSchema(properties, List.of("gav", "oldVersion", "newVersion"));
     }
 
@@ -304,7 +337,6 @@ public final class McpTools {
         properties.put("gav", stringProperty("Target jar GAV \"groupId:artifactId:version\"; exactly one of "
                 + "'project'/'gav' must be given"));
         properties.put("upgrades", stringArrayProperty("Requested upgrades, entries \"groupId:artifactId=newVersion\""));
-        properties.put("repositories", stringArrayProperty("Extra Maven repository URLs"));
         properties.put("threads", integerProperty("Number of worker threads"));
         return objectSchema(properties, List.of("upgrades"));
     }
@@ -343,17 +375,16 @@ public final class McpTools {
 
     @FunctionalInterface
     interface ApiReportRunner {
-        DiffReport run(Gav gav, List<String> repositories);
+        DiffReport run(Gav gav);
     }
 
     @FunctionalInterface
     interface ApiDiffRunner {
-        DiffReport run(String groupId, String artifactId, String oldVersion, String newVersion,
-                List<String> repositories);
+        DiffReport run(String groupId, String artifactId, String oldVersion, String newVersion);
     }
 
     @FunctionalInterface
     interface UpgradeImpactRunner {
-        DiffReport run(UpgradeRequest request, List<String> repositories, int threads);
+        DiffReport run(UpgradeRequest request, int threads);
     }
 }

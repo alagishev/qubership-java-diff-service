@@ -27,8 +27,9 @@ Reports are machine-readable JSON plus optional human-readable HTML, CSV, or XLS
 **Report formats:** `json` (default, always written to `--output-dir/report.json`), `html`, `csv`, `xlsx`.
 Combine with `--format json,html`.
 
-**Log levels** (`--log-level`, global): `INFO` (default), `DEBUG`, `TRACE`, `NOLOGS`. Logs go to stderr;
-stdout is reserved for JSON (when `--format json` only) or MCP traffic.
+**Log levels** (`--log-level`, global on every subcommand): `INFO` (default), `DEBUG`, `TRACE`, `NOLOGS`. Logs go to
+stderr; stdout is reserved for JSON (when `--format json` only) or MCP traffic. At `DEBUG`/`TRACE`, Logback still keeps
+the `org.apache` logger at `WARN` so HttpClient wire dumps do not drown jdiff's own debug output.
 
 ## Architecture
 
@@ -46,7 +47,6 @@ flowchart LR
   subgraph core [jdiff-core pipeline]
     PS[ProjectScanner]
     AR[ArtifactResolver]
-    DE[DependencyExtractor]
     UM[UpgradeMatcher]
     JD[jdeps]
     JI[japicmp]
@@ -55,7 +55,7 @@ flowchart LR
   subgraph render [jdiff-render]
     R[HTML / CSV / XLSX]
   end
-  CLI --> PS --> AR --> DE --> UM
+  CLI --> PS --> AR --> UM
   UM --> JD
   UM --> JI
   JD --> IA
@@ -63,7 +63,7 @@ flowchart LR
   IA --> R
 ```
 
-**Pipeline stages (upgrade mode):** `ProjectScanner` → `ArtifactResolver` → `DependencyExtractor` (incl. BOM
+**Pipeline stages (upgrade mode):** `ProjectScanner` → `ArtifactResolver` (dependency tree + BOM
 expansion) → `UpgradeMatcher` → parallel jdeps + japicmp → `ImpactAnalyzer` → unified JSON model.
 
 | Module | Role |
@@ -77,8 +77,10 @@ expansion) → `UpgradeMatcher` → parallel jdeps + japicmp → `ImpactAnalyzer
 
 - **JDK 21+** — provides `jdeps` on `PATH` via `$JAVA_HOME/bin`.
 - **japicmp fat jar** — bundled next to `jdiff.jar` in the distribution zip, or pass `--japicmp-jar`.
-- **Network** — Maven Central by default; add `--repo` for additional repositories (e.g. GitHub Packages for
-  Netcracker/Qubership artifacts). `--settings` supports `<localRepository>` only (mirrors/servers are not read).
+- **Network** — Maven Central by default; add `--repo` for additional repositories. Prefer named form
+  `id=url` (for example `github=https://maven.pkg.github.com/Netcracker/*`) so `<server><id>` in `--settings`
+  matches. Bare URLs still work and get ids `repo0`, `repo1`, …. `--settings` reads `<localRepository>` and
+  `<servers>` (mirrors, profiles, and proxies are ignored).
 
 ## Build
 
@@ -109,8 +111,10 @@ mvn verify -Djdiff.it=true -Dtest=*IT
 
 ## Usage
 
-Global options (all analysis subcommands): `--output-dir`, `--format`, `--repo`, `--settings`, `--japicmp-jar`,
-`--threads`, `--log-level`.
+Global options for analysis subcommands (`upgrade`, `api-report`, `api-diff`): `--output-dir`, `--format`, `--repo`
+(`id=url` or bare URL), `--settings`, `--japicmp-jar`, `--threads`. Global on every subcommand (including
+`mcp-server`): `--log-level`. `mcp-server` also accepts process-wide `--repo` and `--settings` (tools do not take
+repositories).
 
 **Exit codes:** `0` success, `1` runtime/analysis failure, `2` invalid arguments or unsupported format.
 
@@ -197,7 +201,10 @@ Mode-specific flags: `--gav` (`groupId:artifactId`), `--old`, `--new`.
 ### MCP server
 
 ```bash
-java -jar jdiff.jar mcp-server
+java -jar jdiff.jar mcp-server \
+  --repo central=https://repo1.maven.org/maven2/ \
+  --repo github=https://maven.pkg.github.com/Netcracker/* \
+  --settings /path/to/settings.xml
 ```
 
 Or use `jdiff.bat mcp-server` / `./jdiff.sh mcp-server` from the distribution folder.
@@ -211,7 +218,13 @@ Register in an MCP client (example):
   "mcpServers": {
     "jdiff": {
       "command": "java",
-      "args": ["-jar", "/path/to/jdiff.jar", "mcp-server"],
+      "args": [
+        "-jar", "/path/to/jdiff.jar",
+        "mcp-server",
+        "--repo", "central=https://repo1.maven.org/maven2/",
+        "--repo", "github=https://maven.pkg.github.com/Netcracker/*",
+        "--settings", "/path/to/settings.xml"
+      ],
       "env": {
         "JDIFF_JAPICMP_JAR": "/path/to/japicmp-0.26.1-jar-with-dependencies.jar"
       }
@@ -220,13 +233,15 @@ Register in an MCP client (example):
 }
 ```
 
-Place `japicmp-*.jar` next to `jdiff.jar` to omit `JDIFF_JAPICMP_JAR`.
+Place `japicmp-*.jar` next to `jdiff.jar` to omit `JDIFF_JAPICMP_JAR`. Configure repositories and credentials on the
+`mcp-server` process (`--repo` / `--settings`); tools do not accept a `repositories` argument. Match
+`<server><id>` to the id in `--repo id=url` (for example `github`).
 
 | Tool | Required inputs | Optional inputs |
 | ---- | --------------- | --------------- |
-| `generate_api_report` | `gav` (`groupId:artifactId:version`) | `repositories[]` |
-| `generate_api_diff` | `gav` (`groupId:artifactId`), `oldVersion`, `newVersion` | `repositories[]` |
-| `upgrade_impact` | `upgrades[]` (`groupId:artifactId=newVersion`) | `project` *or* `gav`, `repositories[]`, `threads` |
+| `generate_api_report` | `gav` (`groupId:artifactId:version`) | |
+| `generate_api_diff` | `gav` (`groupId:artifactId`), `oldVersion`, `newVersion` | |
+| `upgrade_impact` | `upgrades[]` (`groupId:artifactId=newVersion`) | `project` *or* `gav`, `threads` |
 
 Each tool returns the unified JSON report as tool result text.
 
@@ -294,7 +309,9 @@ Annotated example:
 
 ## Demo scenarios
 
-Runnable scripts live under [`demo/`](demo/). Build first with `mvn -q package -DskipTests`, then:
+Runnable scripts live under [`demo/`](demo/). Build first with `mvn -q package -DskipTests`, then follow
+[`demo/DEMO-GUIDE.md`](demo/DEMO-GUIDE.md) (includes MCP + `--settings`) or the short
+[`demo/DEMO_GUIDE_INT.md`](demo/DEMO_GUIDE_INT.md) cheat sheet:
 
 | Script | Demonstrates |
 | ------ | ------------ |

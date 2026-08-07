@@ -17,8 +17,7 @@ jdiff answers three related questions for Maven-based Java projects:
 Upgrade impact is the differentiator: it combines **jdeps** (who calls what at the class level) with
 **japicmp** (what changed in the dependency API) and keeps only changes that intersect real usage.
 
-Out of scope: dependency tree resolution beyond direct dependencies for upgrade matching, transitive impact
-propagation, non-Maven build systems, and IDE plugins.
+Out of scope: transitive impact propagation beyond matched upgrades, non-Maven build systems, and IDE plugins.
 
 ## 2. Maven module layout
 
@@ -132,11 +131,11 @@ flowchart TB
 | `UpgradeCommand` | Parses `--project` / `--gav`, `--upgrade` / `--upgrades-file`; builds `UpgradeImpactPipeline`; writes output. |
 | `ApiReportCommand` | Parses `--gav`; runs `ApiReportPipeline`. |
 | `ApiDiffCommand` | Parses `--gav`, `--old`, `--new`; runs `ApiDiffPipeline`. |
-| `McpServerCommand` | Starts `JdiffMcpServer` on stdio. |
-| `OutputOptions` | Shared mixin: `--output-dir`, `--format`, `--repo`, `--settings`, `--japicmp-jar`, `--threads`. |
+| `McpServerCommand` | Starts `JdiffMcpServer` on stdio; process-wide `--repo` and `--settings`. |
+| `OutputOptions` | Shared mixin: `--output-dir`, `--format`, `--repo` (`id=url` or URL), `--settings`, `--japicmp-jar`, `--threads`. |
 | `CliSupport` | Factory methods: `RepositoryConfig`, `ArtifactResolver`, `JapicmpJarComparator`; japicmp jar discovery; `writeReportAndCheckFormat`. |
 | `JdiffMcpServer` | MCP transport over stdio; EOF-aware shutdown; registers three tools from `McpTools`. |
-| `McpTools` | MCP tool specs wrapping the same pipelines as CLI; japicmp path from `JDIFF_JAPICMP_JAR` env var. |
+| `McpTools` | MCP tool specs wrapping the same pipelines as CLI; japicmp from `JDIFF_JAPICMP_JAR`; process-wide repos/settings. |
 
 All analysis subcommands produce a **`DiffReport`**, serialize it to **`report.json`**, then optionally render
 additional formats.
@@ -160,29 +159,32 @@ jdeps, comparator, thread pool size).
 | Class | Responsibility |
 | ----- | -------------- |
 | `UpgradeSpec` | Parsed `groupId:artifactId=newVersion` from CLI or upgrades file. |
-| `UpgradeItem` | Concrete old→new version pair for one artifact after matching or BOM expansion. |
-| `UpgradeMatcher` | Matches requested upgrades against a module's **direct** dependencies by GA. |
-| `BomUpgradeExpander` | Given an import-scoped BOM upgrade, expands to per-dependency `UpgradeItem`s whose managed versions change. |
+| `UpgradeItem` | Concrete old→new version pair for one artifact after matching or BOM expansion (`direct` flag). |
+| `UpgradeMatcher` | Matches requested upgrades against a module's **resolved dependency tree** by GA (any depth). |
+| `BomUpgradeExpander` | Expands a BOM upgrade into per-dependency `UpgradeItem`s for jars that appear in the tree. |
+| `UnmatchedUpgrade` | Requested upgrade that could not be matched/expanded, with a reason code. |
 | `ImpactAnalyzer` | Filters japicmp `ApiChange` list to entries whose class is referenced by jdeps usage; attaches `usedBy` refs. |
 
-BOM expansion logic: locate the import BOM in the module's **raw model lineage** (module + ancestors),
-resolve its current version, load old and new BOM effective models, and diff managed versions against the
-module's direct dependencies.
+BOM expansion logic: if the upgrade matches an import BOM in the module's **raw model lineage** (module +
+ancestors), load old and new BOM effective models and emit upgrades for tree dependencies whose managed
+version changes. If the upgrade is not in the tree but the requested GAV is a POM with dependency
+management, expand using the new BOM against the tree. Empty expansions are reported as unmatched
+(`BOM_NOT_EXPANDED`), not silently dropped.
 
 ### 3.4 Resolution layer (`jdiff-core`)
 
 | Class | Responsibility |
 | ----- | -------------- |
-| `ArtifactResolver` | Interface: `resolveJar(Gav)`, `resolvePom(Gav)`. |
-| `MavenArtifactResolver` | Eclipse Aether-based download into the local repository; attaches auth from `RepositoryConfig`. |
-| `RepositoryConfig` | Built from `--repo` URLs and optional `--settings`; reads `<localRepository>` and `<servers>`. |
+| `ArtifactResolver` | Interface: `resolveJar`, `resolvePom`, `resolveDependencyTree`. |
+| `MavenArtifactResolver` | Eclipse Aether-based download into the local repository; collects dependency trees via `CollectRequest`; attaches auth from `RepositoryConfig`. |
+| `RepositoryConfig` | Built from `--repo` tokens (`id=url` or bare URL) and optional `--settings`; reads `<localRepository>` and `<servers>`. |
 | `ServerCredentials` | Username/password pair keyed by Maven server id. |
 | `RemoteRepo` | Remote repository id + URL. |
 | `EffectivePomBuilder` | Builds effective Maven models from a local `pom.xml` or a remote BOM/jar POM via the resolver. |
 | `ResolverModelResolver` | Bridges Maven Model Builder to Aether for parent/BOM resolution. |
 | `ProjectScanner` | Recursively walks `<modules>`; yields `MavenModule` (GAV, pom path, packaging, optional `target/*.jar`). |
 | `DependencyExtractor` | Lists direct compile/runtime/provided dependencies from an effective model with resolved versions. |
-| `ResolvedDependency` | GAV + scope + optional flag. |
+| `ResolvedDependency` | GAV + scope + optional flag + tree `depth` (0 = direct). |
 | `MavenModule` | One module discovered by the scanner. |
 
 Upgrade impact analyzes only **jar/bundle** packaging modules. Unresolvable module jars are skipped when no
@@ -362,7 +364,7 @@ sequenceDiagram
 
     Client->>Transport: JSON-RPC on stdin
     Transport->>Tools: callTool(name, arguments)
-    Tools->>Tools: build RepositoryConfig from tool args
+    Tools->>Tools: RepositoryConfig(process --repo / --settings)
     Tools->>Pipe: run (same as CLI)
     Pipe-->>Tools: DiffReport
     Tools->>Tools: JsonSupport.toJson
@@ -373,9 +375,13 @@ sequenceDiagram
 Constraints:
 
 - **stdout** carries MCP protocol only; Logback is configured to log to **stderr** (`logback.xml`).
+- `org.apache` loggers stay at `WARN` even when `--log-level DEBUG` raises the root logger (suppresses HttpClient wire
+  noise).
+- Process-wide Maven repos and settings come from `mcp-server --repo` / `--settings` (not from tool arguments). Prefer
+  `--repo github=https://…` so `<server><id>github</id>` matches.
 - stdin EOF (via `EofWatchingInputStream`) triggers graceful shutdown.
 - Three tools: `generate_api_report`, `generate_api_diff`, `upgrade_impact` — parameter shapes mirror CLI
-  inputs.
+  inputs (without repositories).
 
 ## 7. Data model (JSON)
 
@@ -404,12 +410,13 @@ Renderers consume `DiffReport` in memory; they do not re-parse JSON from disk.
 
 | Source | Effect |
 | ------ | ------ |
-| `--repo` (repeatable) | Remote Maven repositories; ids `repo0`, `repo1`, … assigned in order. |
-| `--settings` | Optional `settings.xml`: local repo path + server credentials matched by repo id. |
+| `--repo` (repeatable) | Maven repo token: `id=url` or bare URL (`repo0`, `repo1`, … by index). |
+| `--settings` | Optional `settings.xml`: `<localRepository>` and `<servers>` (credentials keyed by repo id). |
+| `mcp-server --repo` / `--settings` | Process-wide repos and settings for every MCP tool call. |
 | `--japicmp-jar` | Explicit japicmp fat jar path; else scan next to running jar or `./japicmp/`. |
 | `--threads` | jdeps parallelism in upgrade mode. |
 | `--format` | `json` (always written), plus optional `html`, `csv`, `xlsx`. |
-| `--log-level` | Logback root level: INFO, DEBUG, TRACE, NOLOGS. |
+| `--log-level` | Logback root level: INFO, DEBUG, TRACE, NOLOGS (`org.apache` stays WARN). |
 | `JDIFF_JAPICMP_JAR` | MCP-only japicmp path override. |
 
 Default remote repository when no `--repo` is given: Maven Central.
@@ -449,19 +456,19 @@ use captured output fixtures.
 | --------- | --- |
 | Embed in another JVM app | Depend on `jdiff-core`; construct pipelines directly with custom `ArtifactResolver` or `JarComparator`. |
 | New output format | Implement `ReportRenderer`; register in `Renderers.FACTORIES`. |
-| Custom repository auth | Provide `RepositoryConfig` programmatically or extend settings parsing. |
+| Custom repository auth | Put `<servers>` in `--settings` / `mcp-server --settings`, or build `RepositoryConfig` in code. |
 | Alternative API diff engine | Implement `JarComparator`; inject into pipelines. |
 | CI / agent integration | Use CLI JSON output or MCP stdio server. |
 
 ## 12. Known limitations
 
-- Upgrade matching considers **direct dependencies only** (plus BOM-managed versions for those deps).
-- Transitive dependency version changes without a direct dep version change are not modeled unless a BOM
-  expansion covers them.
+- Upgrade matching uses the **resolved dependency tree** (compile/runtime/provided). Test-scoped deps are
+  excluded.
+- `includeUsedTransitives` (auto-upgrade used tree jars that were not listed in `--upgrade`) is not
+  implemented; list transitive GAs or bump the managing BOM explicitly.
 - Effective POM building approximates Maven (Model Builder + Resolver); edge-case POM features may differ from
   a full `mvn` build.
-- jdeps usage analysis requires resolvable dependency jars on the classpath; missing jars are excluded with a
-  WARN.
+- jdeps usage analysis uses the full resolved tree as classpath; missing jars are excluded with a WARN.
 - Module jars must exist locally (repo or `target/*.jar`) for upgrade impact; unpublished application modules
   are skipped.
 
@@ -471,3 +478,4 @@ use captured output fixtures.
 | -------- | ----------- |
 | [README.md](README.md) | User-facing overview, quick start, CLI reference |
 | [demo/DEMO-GUIDE.md](demo/DEMO-GUIDE.md) | Manual step-by-step demo commands for Qubership artifacts |
+| [demo/DEMO_GUIDE_INT.md](demo/DEMO_GUIDE_INT.md) | Short internal demo cheat sheet (CLI + MCP) |

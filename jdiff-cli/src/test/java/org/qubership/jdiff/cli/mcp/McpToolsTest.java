@@ -7,6 +7,7 @@ import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.TextContent;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
@@ -24,17 +25,15 @@ class McpToolsTest {
     void generateApiReportHappyPathReturnsTheReportAsJsonTextContent() {
         DiffReport fakeReport = sampleReport(ReportMode.API_REPORT);
         McpTools tools = new McpTools(
-                (gav, repositories) -> {
+                gav -> {
                     assertThat(gav).isEqualTo(Gav.parse("org.example:app:1.0.0"));
-                    assertThat(repositories).containsExactly("https://example.com/repo");
                     return fakeReport;
                 },
                 failingApiDiffRunner(),
                 failingUpgradeImpactRunner());
 
         CallToolResult result = callHandler(tools.generateApiReportTool(), Map.of(
-                "gav", "org.example:app:1.0.0",
-                "repositories", List.of("https://example.com/repo")));
+                "gav", "org.example:app:1.0.0"));
 
         assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
         DiffReport parsed = parseReport(result);
@@ -56,7 +55,7 @@ class McpToolsTest {
         DiffReport fakeReport = sampleReport(ReportMode.API_DIFF);
         McpTools tools = new McpTools(
                 failingApiReportRunner(),
-                (groupId, artifactId, oldVersion, newVersion, repositories) -> {
+                (groupId, artifactId, oldVersion, newVersion) -> {
                     assertThat(groupId).isEqualTo("org.example");
                     assertThat(artifactId).isEqualTo("app");
                     assertThat(oldVersion).isEqualTo("1.0.0");
@@ -90,7 +89,7 @@ class McpToolsTest {
         McpTools tools = new McpTools(
                 failingApiReportRunner(),
                 failingApiDiffRunner(),
-                (request, repositories, threads) -> {
+                (request, threads) -> {
                     assertThat(request.targetGav()).isEqualTo(Gav.parse("org.example:app:1.0.0"));
                     assertThat(request.upgrades()).hasSize(1);
                     return fakeReport;
@@ -142,7 +141,7 @@ class McpToolsTest {
     @Test
     void exceptionFromThePipelineIsCaughtAndReturnedAsIsErrorInsteadOfThrowing() {
         McpTools tools = new McpTools(
-                (gav, repositories) -> {
+                gav -> {
                     throw new IllegalStateException("boom");
                 },
                 failingApiDiffRunner(),
@@ -160,7 +159,7 @@ class McpToolsTest {
         McpTools tools = new McpTools(
                 failingApiReportRunner(),
                 failingApiDiffRunner(),
-                (request, repositories, threads) -> {
+                (request, threads) -> {
                     assertThat(request.projectDir()).isEqualTo(Path.of("some/project"));
                     assertThat(request.targetGav()).isNull();
                     return fakeReport;
@@ -173,20 +172,68 @@ class McpToolsTest {
         assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
     }
 
+    @Test
+    void createDefaultStoresProcessSettingsAndRepoTokens() {
+        Path settings = Path.of("demo/work/github-settings.xml");
+        List<String> repos = List.of(
+                "central=https://repo1.maven.org/maven2/",
+                "github=https://maven.pkg.github.com/Netcracker/*");
+
+        McpTools tools = McpTools.createDefault(settings, repos);
+
+        assertThat(tools.settingsXml()).isEqualTo(settings);
+        assertThat(tools.repoTokens()).containsExactlyElementsOf(repos);
+    }
+
+    @Test
+    void repositoryConfigAppliesNamedRepoCredentialsFromSettings() throws Exception {
+        Path settings = Files.createTempFile("jdiff-mcp-settings", ".xml");
+        Files.writeString(settings, """
+                <settings>
+                  <servers>
+                    <server>
+                      <id>github</id>
+                      <username>x-access-token</username>
+                      <password>secret-token</password>
+                    </server>
+                  </servers>
+                </settings>
+                """);
+        try {
+            var config = McpTools.repositoryConfig(
+                    List.of("github=https://maven.pkg.github.com/Netcracker/*"), settings);
+
+            assertThat(config.repositories().get(0).id()).isEqualTo("github");
+            assertThat(config.serverCredentials().get("github").username()).isEqualTo("x-access-token");
+            assertThat(config.serverCredentials().get("github").password()).isEqualTo("secret-token");
+        } finally {
+            Files.deleteIfExists(settings);
+        }
+    }
+
+    @Test
+    void toolSchemasDoNotExposeRepositoriesParameter() {
+        McpTools tools = new McpTools(failingApiReportRunner(), failingApiDiffRunner(), failingUpgradeImpactRunner());
+
+        assertThat(tools.generateApiReportTool().tool().inputSchema().toString()).doesNotContain("repositories");
+        assertThat(tools.generateApiDiffTool().tool().inputSchema().toString()).doesNotContain("repositories");
+        assertThat(tools.upgradeImpactTool().tool().inputSchema().toString()).doesNotContain("repositories");
+    }
+
     private static McpTools.ApiReportRunner failingApiReportRunner() {
-        return (gav, repositories) -> {
+        return gav -> {
             throw new AssertionError("apiReportRunner should not have been called");
         };
     }
 
     private static McpTools.ApiDiffRunner failingApiDiffRunner() {
-        return (groupId, artifactId, oldVersion, newVersion, repositories) -> {
+        return (groupId, artifactId, oldVersion, newVersion) -> {
             throw new AssertionError("apiDiffRunner should not have been called");
         };
     }
 
     private static McpTools.UpgradeImpactRunner failingUpgradeImpactRunner() {
-        return (request, repositories, threads) -> {
+        return (request, threads) -> {
             throw new AssertionError("upgradeImpactRunner should not have been called");
         };
     }

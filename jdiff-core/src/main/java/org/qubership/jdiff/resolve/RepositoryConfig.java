@@ -4,9 +4,11 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
@@ -38,22 +40,30 @@ public record RepositoryConfig(
     }
 
     /**
-     * Builds a configuration from explicit repository URLs and an optional settings.xml.
+     * Builds a configuration from explicit repository tokens and an optional settings.xml.
      *
-     * @param repoUrls   repository URLs; empty or {@code null} falls back to Central
-     * @param settingsXml optional path to a settings.xml to read {@code <localRepository>} from;
-     *                     may be {@code null}. Only that single element is honored -- mirrors,
-     *                     servers, profiles and proxies are out of scope.
+     * <p>Each token is either a bare URL (assigned id {@code repo0}, {@code repo1}, … by list index) or
+     * {@code id=url} so the id can match a {@code <server><id>} entry in settings.xml.
+     *
+     * @param repoTokens  repository tokens; empty or {@code null} falls back to Central
+     * @param settingsXml optional path to a settings.xml to read {@code <localRepository>} and
+     *                    {@code <servers>} from; may be {@code null}. Mirrors, profiles and proxies are
+     *                    out of scope.
      * @return the resulting configuration
      */
-    public static RepositoryConfig of(List<String> repoUrls, Path settingsXml) {
+    public static RepositoryConfig of(List<String> repoTokens, Path settingsXml) {
         List<RemoteRepo> repos;
-        if (repoUrls == null || repoUrls.isEmpty()) {
+        if (repoTokens == null || repoTokens.isEmpty()) {
             repos = List.of(new RemoteRepo("central", CENTRAL_URL));
         } else {
             List<RemoteRepo> mutable = new ArrayList<>();
-            for (int i = 0; i < repoUrls.size(); i++) {
-                mutable.add(new RemoteRepo("repo" + i, repoUrls.get(i)));
+            Set<String> seenIds = new HashSet<>();
+            for (int i = 0; i < repoTokens.size(); i++) {
+                RemoteRepo repo = parseRepoToken(repoTokens.get(i), i);
+                if (!seenIds.add(repo.id())) {
+                    throw new IllegalArgumentException("Duplicate repository id '" + repo.id() + "'");
+                }
+                mutable.add(repo);
             }
             repos = List.copyOf(mutable);
         }
@@ -79,6 +89,27 @@ public record RepositoryConfig(
             }
         }
         return new RepositoryConfig(repos, localRepository, serverCredentials);
+    }
+
+    /**
+     * Parses one {@code --repo} token: {@code id=url} or a bare URL (id {@code repo}{@code index}).
+     */
+    static RemoteRepo parseRepoToken(String token, int index) {
+        if (token == null || token.isBlank()) {
+            throw new IllegalArgumentException("Repository token must not be blank");
+        }
+        String trimmed = token.trim();
+        int eq = trimmed.indexOf('=');
+        if (eq < 0) {
+            return new RemoteRepo("repo" + index, trimmed);
+        }
+        String id = trimmed.substring(0, eq).trim();
+        String url = trimmed.substring(eq + 1).trim();
+        if (id.isEmpty() || url.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Invalid repository token '" + token + "': expected 'id=url' with non-blank id and url");
+        }
+        return new RemoteRepo(id, url);
     }
 
     private static Path defaultLocalRepository() {

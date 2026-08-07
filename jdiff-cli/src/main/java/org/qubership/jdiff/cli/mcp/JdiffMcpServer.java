@@ -9,6 +9,8 @@ import io.modelcontextprotocol.spec.McpSchema.ServerCapabilities;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Path;
+import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -29,6 +31,14 @@ public class JdiffMcpServer {
 
     public JdiffMcpServer() {
         this(McpTools.createDefault());
+    }
+
+    /**
+     * @param settingsXml optional Maven {@code settings.xml} for the process; may be {@code null}
+     * @param repoTokens  process-wide {@code --repo} tokens ({@code id=url} or bare URL); may be empty
+     */
+    public JdiffMcpServer(Path settingsXml, List<String> repoTokens) {
+        this(McpTools.createDefault(settingsXml, repoTokens));
     }
 
     JdiffMcpServer(McpTools tools) {
